@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Syntax and style only. A real build needs the device's kernel tree
+  # (vendor display headers + a matching Module.symvers), which is not
+  # distributable, so it cannot run here.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Check SPDX headers
+        run: |
+          set -e
+          fail=0
+          for f in $(git ls-files '*.c' '*.h'); do
+            head -1 "$f" | grep -q 'SPDX-License-Identifier: GPL-2.0-only' \
+              || { echo "missing SPDX in $f"; fail=1; }
+          done
+          exit $fail
+
+      - name: Check shell scripts parse
+        run: |
+          set -e
+          for f in $(git ls-files '*.sh'); do
+            sh -n "$f" || { echo "syntax error in $f"; exit 1; }
+          done
+
+      - name: Check for tabs in Makefile
+        run: |
+          grep -Pn '^    ' Makefile && { echo "Makefile uses spaces"; exit 1; } || true
+
+      - name: Ensure build output is ignored
+        run: |
+          set -e
+          touch test.o test.ko Module.symvers modules.order
+          git status --porcelain | grep -q 'test\.' && {
+            echo "build artifacts are not ignored"; exit 1; }
+          rm -f test.o test.ko Module.symvers modules.order
