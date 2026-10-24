@@ -92,10 +92,11 @@ Then, per LM, `sde_crtc_atomic_begin()` calls
 ### 3.1 RECT0 is programmed full width
 
 `setup_rects()` writes `cfg->src_rect.w` straight into `SSPP_SRC_SIZE`. On a
-single-plane commit that is 3200 — wider than the mixer. Left alone, the LM
-overflows regardless of what the blend stage says.
+single-plane commit that is 3200 — wider than the mixer's 2560 limit. Left
+alone, the LM overflows regardless of what the blend stage says.
 
-The module rewrites RECT0 with half the width before programming RECT1.
+The module rewrites RECT0 with half the width and programs RECT1 with the other
+half.
 
 ### 3.2 RECT1 needs its own registers
 
@@ -109,9 +110,6 @@ SSPP_OUT_XY_REC1     0x164
 SSPP_SRC1_ADDR       0x18    (luma/chroma 0)
 SSPP_SRC3_ADDR                (chroma 1/2)
 ```
-
-`setup_rects(ctx, cfg, SDE_SSPP_RECT_1)` handles the first four;
-`setup_sourceaddress(ctx, cfg, SDE_SSPP_RECT_1)` handles the addresses.
 
 Skip the address step and RECT1 reads whatever was there before — which shows
 up as the *entire* screen being wrong, not just half. That was the first wrong
@@ -134,35 +132,81 @@ The position within the framebuffer comes from `src_rect`, not from the
 address. Both rectangles point at the same base; `SSPP_SRC_XY_REC1` says where
 to start reading.
 
-### 3.4 update_multirect is called last, with SOLO
+### 3.4 The write has to happen in the CRTC flush, not in setup_rects
 
-This is the subtle one, and it cost the most time.
+This is the one that matters, and it is why 1.0.0 did not work.
 
-```c
-static void sde_hw_sspp_update_multirect(struct sde_hw_pipe *ctx,
-                bool enable,
-                enum sde_sspp_multirect_index index,
-                enum sde_sspp_multirect_mode mode)
-{
-        if (index == SDE_SSPP_RECT_SOLO) {
-                mode_mask = 0;          /* clears everything */
-        } else {
-                mode_mask = SDE_REG_READ(&ctx->hw, SSPP_MULTIRECT_OPMODE + idx);
-                if (enable)
-                        mode_mask |= index;
-                ...
-        }
-        SDE_REG_WRITE(&ctx->hw, SSPP_MULTIRECT_OPMODE + idx, mode_mask);
-}
+Rewriting the geometry from a **post handler on `sde_hw_sspp_setup_rects()`**
+looks correct. The value reads back properly from inside the handler:
+
+```
+mini: SRC_SIZE 00000000 -> 08580640      (1600 wide)
 ```
 
-Because `_sde_plane_update_roi_config()` calls it **last** with `SOLO`, any
-RECT1 bit set earlier is wiped to zero. Programming RECT1 from a
-`setup_rects` post-handler and expecting it to survive does not work.
+But by the time the CRTC flush begins, it has been put back:
 
-The module therefore intercepts that final call and rewrites its `index`
-argument to `SDE_SSPP_RECT_0 | SDE_SSPP_RECT_1` (value 3). Then
-`mode_mask |= index` yields `0b11` and both rectangles are live.
+```
+mini: at flush START SRC_SIZE=08580c80    (3200 wide again)
+```
+
+Something later in the same commit rewrites the register. Programming RECT1
+from that same post handler is subject to the same problem, and it explains the
+observed symptom: with only RECT0 shrunk the panel shows the left half correctly
+and the right half grey — exactly what "RECT1 never programmed" predicts.
+
+Writing from the **pre handler of `sde_crtc_atomic_flush()`** survives the whole
+commit and the next frame:
+
+```
+flush START   08580c80
+after write   08580640
+flush end     08580640
+restore       08580640
+next frame    08580640
+```
+
+That is the whole trick. Everything else in this document is secondary.
+
+Consequences:
+
+- `sde_hw_sspp_setup_format` does not need to be hooked: the format mirrors
+  through RECT0's layout.
+- `sde_hw_sspp_update_multirect` does not need to be hooked either. The driver
+  programs it correctly for the rectangles it thinks it is using; the module
+  only overrides the geometry afterwards, at flush time.
+
+### 3.5 Blend stage: flip rec_id, do not invent the byte
+
+The driver already writes the correct `pipe_type` and `pipe_id` for the plane
+into both mixers. So the module never invents those bits: it reads the byte the
+driver wrote and only flips `rec_id`, leaving the left mixer on RECT0 and
+putting the right mixer on RECT1. That keeps it working no matter which SSPP
+the compositor picks.
+
+The stage register offsets are **not** evenly spaced from zero. They come from
+`qcom,sde-mixer-blend-op-off`, which on piano reads:
+
+```
+64 112 160 208 256 304 352 400 448 496 544
+```
+
+i.e. `0x40, 0x70, 0xa0, …`. Do not assume `0x04 + (n-1) * 0x30`; that lands on
+`LM_OUT_SIZE` and silently reports nonsense.
+
+### 3.6 Routing is not the CTL's job here (see also §4)
+
+piano's CTL advertises `SDE_CTL_NO_LAYER_EXT`, so `ops->setup_blendstage` is
+left `NULL` and routing uses `CTL_PIPE_ACTIVE` / `CTL_LAYER_ACTIVE`, which are
+per-SSPP and do not distinguish the two rectangles. Which rectangle a mixer
+reads is decided solely by the layer mixer's stage register:
+
+```
+LM_BLEND0_FG_SRC_SEL_V1 (stage base + 0x04), one byte per layout:
+    pipe_type(2) << 6 | rec_id(2) << 4 | pipe_id(4)
+```
+
+`rec_id` 0 is RECT0/SOLO and 1 is RECT1. A single-plane commit leaves the second
+byte at `LM_SRC_SEL_RESET_VALUE`, so that half never fetches anything.
 
 ---
 

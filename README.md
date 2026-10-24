@@ -42,49 +42,71 @@ path**.
 
 ## How it works
 
-Four kprobes, all resolved through kallsyms so `msm_drm` need not export
+Three kprobes, all resolved through kallsyms so `msm_drm` need not export
 anything:
 
 | Hook | Type | What it does |
 | --- | --- | --- |
-| `sde_hw_sspp_setup_rects` | post | rewrite RECT0 to the left half, program RECT1 with the right half |
-| `sde_hw_sspp_setup_format` | post | mirror the pixel format into RECT1 |
-| `sde_hw_sspp_update_multirect` | pre | turn a `SOLO` call into `RECT_0 \| RECT_1` |
-| `sde_hw_lm_setup_blendstage` | pre | give a single-pipe blend stage a RECT1 entry |
+| `sde_hw_sspp_setup_rects` | post | remember RECT0's geometry for the flush handler |
+| `sde_hw_lm_setup_blendstage` | pre | flip `rec_id` so the right mixer reads RECT1 |
+| `sde_crtc_atomic_flush` | pre | **write RECT0/RECT1 here** — this is the one that matters |
 
 Only planes wider than `min_split_width` (default 2561) are touched, so the
 normal two-plane path Android uses is left byte-for-byte identical.
 
-### Why each hook is needed
+### Why the write has to happen at flush time
 
-**RECT0 must be rewritten.** The driver programs RECT0 with the *full* width.
-Leaving it at 3200 on a 2560-wide LM overflows:
+This is the single thing that made the module work, so it is worth being
+blunt about it.
+
+Rewriting the geometry from a post handler on `sde_hw_sspp_setup_rects()`
+looks correct — the value reads back properly from inside the handler:
 
 ```
-before: src_size=0x08580c80  (2136 × 3200)
-after:  src_size=0x08580640  (2136 × 1600)
+SRC_SIZE 00000000 -> 08580640      (2136 × 1600)
 ```
 
-**RECT1 needs its own source address.** It reads `SSPP_SRC1_ADDR` /
-`SSPP_SRC3_ADDR`; without programming them it fetches stale memory and the
-whole screen goes wrong.
+but by the time the CRTC flush starts it has been put back:
+
+```
+at flush START SRC_SIZE=08580c80   (2136 × 3200)
+```
+
+Something later in the same commit rewrites the register. From the pre handler
+of `sde_crtc_atomic_flush()` the write survives the whole commit and the next
+frame:
+
+```
+flush START   08580c80
+after write   08580640
+flush end     08580640
+next frame    08580640
+```
+
+The earlier symptom was exactly what "RECT1 never programmed" predicts: the
+left half correct, the right half grey.
+
+Because the write happens late, two hooks the first version needed are gone:
+
+- `sde_hw_sspp_setup_format` — the format mirrors through RECT0's layout.
+- `sde_hw_sspp_update_multirect` — the driver programs it correctly for the
+  rectangles it thinks it is using; the module only overrides the geometry
+  afterwards.
+
+### RECT0 must be rewritten
+
+The driver programs RECT0 with the *full* width. Leaving it at 3200 on a
+2560-wide LM overflows, so the flush handler writes half the width into RECT0
+and the other half into RECT1.
+
+### RECT1 needs its own source address
+
+It reads `SSPP_SRC1_ADDR` / `SSPP_SRC3_ADDR`; without programming them it
+fetches stale memory and the whole screen goes wrong.
 
 **Do not add a byte offset to the RECT1 address.** Upstream's
 `dpu_plane_sspp_update_pipe()` hands both pipes the *same* layout; the offset
 into the framebuffer comes from `src_rect`, not from the address.
-
-**The multirect enable has to be widened, not added.** This is the subtle one.
-`_sde_plane_update_roi_config()` calls `update_multirect()` **last**, with
-`SDE_SSPP_RECT_SOLO`, and the implementation does:
-
-```c
-if (index == SDE_SSPP_RECT_SOLO)
-        mode_mask = 0;                                  /* clears everything */
-SDE_REG_WRITE(ctx->hw, SSPP_MULTIRECT_OPMODE + idx, mode_mask);
-```
-
-so any RECT1 bit set earlier is wiped. Rewriting that final call's index to
-`RECT_0 | RECT_1` makes `mode_mask |= index` produce `0b11`.
 
 ## The blend stage encoding
 
@@ -160,9 +182,10 @@ Check it is working:
 
 ```sh
 dmesg | grep sde-split
-# sde-split: lm=1 split 1 stage
-# sde-split: rect1 src(1600,0 1600x2136) dst(1600,0 1600x2136)
-# sde-split: multirect widened to both rects
+# sde-split: armed, min_width=2561
+# sde-split: captured sspp=3 src 3200x2136+0+0 dst 3200x2136
+# sde-split: lm1 stage1 c0c0c0c0 -> 00c0c0c0
+# sde-split: applied #1 rect0 1600x2136+0+0 rect1 1600x2136+1600+0 mr=3
 ```
 
 Unload restores stock behaviour on the next commit:
